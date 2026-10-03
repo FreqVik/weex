@@ -1,0 +1,7 @@
+user_session.session
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+.env

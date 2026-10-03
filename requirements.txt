@@ -1,0 +1,10 @@
+ccxt
+httpx
+sqlalchemy
+dotenv
+telethon
+fastapi
+redis
+rq
+uvicorn
+python-dotenv
