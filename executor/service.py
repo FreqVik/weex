@@ -87,7 +87,10 @@ class TradeExecutionService:
         if reference_price <= 0:
             raise ValueError(f"Invalid reference price ({reference_price}) for symbol '{symbol}'.")
 
-        raw_qty = self.risk_usdt / reference_price
+        market = self.markets[symbol]
+        contract_size = float(market.get("contractSize") or 1.0)
+        raw_qty = self.risk_usdt / (reference_price * contract_size)
+        
         formatted_qty_str = self.exchange.amount_to_precision(symbol, raw_qty)
 
         try:
