@@ -15,9 +15,10 @@ class TradeExecutionService:
     - TP == 'OPEN'   -> No TP bracket
     - TP == float    -> Set Take-Profit
     - SL == float    -> Set Stop-Loss
+    - Position size sized to lose exactly risk_usdt if SL is hit.
     """
 
-    def __init__(self, risk_usdt: float = 20.0, sandbox: Optional[bool] = None):
+    def __init__(self, risk_usdt: float = 10.0, sandbox: Optional[bool] = None):
         self.api_key = os.getenv("WEEX_API_KEY")
         self.secret = os.getenv("WEEX_SECRET_KEY")
         self.passphrase = os.getenv("WEEX_PASSPHRASE")
@@ -67,7 +68,7 @@ class TradeExecutionService:
     @staticmethod
     def resolve_symbol(pair: str) -> str:
         """
-        Converts parsed strings (e.g., 'KASUUSDT', 'APTUSDT', 'BTCUSDT')
+        Converts parsed strings (e.g., 'KASUUSDT', 'APTUSDT', 'BTCUSDT', 'ZAMAUSDT')
         into CCXT standard swap notation: 'KASU/USDT:USDT', 'APT/USDT:USDT'
         """
         clean = pair.upper().replace("/", "").replace("-", "").strip()
@@ -76,10 +77,51 @@ class TradeExecutionService:
             return f"{base}/USDT:USDT"
         return f"{clean}/USDT:USDT"
 
-    def calculate_amount(self, symbol: str, reference_price: float) -> float:
+    def calculate_safe_leverage(self, ref_price: float, sl_price: Optional[float]) -> int:
         """
-        Calculates order contract quantity based on USDT allocation and exchange precision.
-        Raises ValueError if calculation or limits fail. Never falls back to a default value.
+        Calculates safe leverage dynamically so liquidation is safely
+        behind the Stop Loss, keeping initial margin within small wallet bounds.
+        Clamped to 20x max to support altcoin tier restrictions.
+        """
+        if not sl_price or sl_price <= 0:
+            return 10  # Fallback leverage if no SL is provided
+
+        sl_distance_pct = abs(ref_price - sl_price) / ref_price
+        if sl_distance_pct <= 0:
+            return 10
+
+        # Theoretical liquidation distance is ~1/leverage.
+        # Apply a 30% safety cushion (0.70 / sl_distance_pct).
+        calculated_leverage = int(0.70 / sl_distance_pct)
+
+        # Clamp between 3x (wide swings) and 20x (capped for altcoin tiers)
+        return max(3, min(calculated_leverage, 20))
+
+    def set_leverage(self, symbol: str, leverage: int) -> None:
+        """
+        Sets the leverage on WEEX for the specified symbol.
+        Provides both isolatedLongLeverage and isolatedShortLeverage
+        to prevent WEEX error code -1141.
+        """
+        try:
+            params = {
+                "isolatedLongLeverage": leverage,
+                "isolatedShortLeverage": leverage,
+            }
+            self.exchange.set_leverage(leverage, symbol, params=params)
+            print(f"[*] Set leverage to {leverage}x for {symbol}")
+        except Exception as e:
+            # Fallback for unified or cross-margin mode
+            try:
+                self.exchange.set_leverage(leverage, symbol)
+                print(f"[*] Set leverage to {leverage}x for {symbol} (fallback)")
+            except Exception as inner_e:
+                print(f"[!] Warning setting leverage for {symbol} ({leverage}x): {inner_e}")
+
+    def calculate_amount(self, symbol: str, reference_price: float, sl_price: Optional[float] = None) -> float:
+        """
+        Calculates order contract quantity so that:
+        amount * |reference_price - sl_price| == self.risk_usdt ($10)
         """
         if not self.markets or symbol not in self.markets:
             raise ValueError(f"Market metadata not loaded or symbol '{symbol}' not found on WEEX.")
@@ -87,10 +129,17 @@ class TradeExecutionService:
         if reference_price <= 0:
             raise ValueError(f"Invalid reference price ({reference_price}) for symbol '{symbol}'.")
 
-        market = self.markets[symbol]
-        contract_size = float(market.get("contractSize") or 1.0)
-        raw_qty = self.risk_usdt / (reference_price * contract_size)
-        
+        # Position sizing based directly on SL distance in USDT
+        if sl_price is not None and sl_price > 0:
+            price_distance = abs(reference_price - sl_price)
+            if price_distance <= 0:
+                raise ValueError(f"Entry ({reference_price}) and SL ({sl_price}) cannot be identical.")
+
+            raw_qty = self.risk_usdt / price_distance
+        else:
+            # Fallback if no SL provided: treat risk_usdt as notional position
+            raw_qty = self.risk_usdt / reference_price
+
         formatted_qty_str = self.exchange.amount_to_precision(symbol, raw_qty)
 
         try:
@@ -101,11 +150,12 @@ class TradeExecutionService:
         if qty <= 0:
             raise ValueError(
                 f"Calculated amount {qty} is too small for precision of '{symbol}'. "
-                f"Risk allocation ({self.risk_usdt} USDT) at price ({reference_price}) rounds to zero."
+                f"Target risk ({self.risk_usdt} USDT) at price ({reference_price}) rounds to zero."
             )
 
-        # Validate against exchange minimum amount limits if defined
-        market_limits = self.markets[symbol].get("limits", {}).get("amount", {})
+        # Validate against exchange minimum contract limits
+        market = self.markets[symbol]
+        market_limits = market.get("limits", {}).get("amount", {})
         min_amount = market_limits.get("min")
         if min_amount is not None and qty < min_amount:
             raise ValueError(
@@ -126,7 +176,7 @@ class TradeExecutionService:
         """
         Validates signal parameters and executes the order on WEEX.
         Attaches native TP/SL parameters directly to the entry order payload.
-        Skips signal cleanly if amount calculation or market loading fails.
+        Sets dynamic leverage and sizes strictly to risk_usdt on SL.
         """
         raw_pair = signal["pair"]
         action = signal["action"].upper()
@@ -142,7 +192,7 @@ class TradeExecutionService:
         order_type = "market" if is_market else "limit"
 
         has_tp = tp_val is not None and not (isinstance(tp_val, str) and tp_val.strip().upper() == "OPEN")
-        has_sl = sl_val is not None
+        has_sl = sl_val is not None and not (isinstance(sl_val, str) and sl_val.strip().upper() == "OPEN")
 
         try:
             self.load_markets()
@@ -155,8 +205,14 @@ class TradeExecutionService:
                 ref_price = float(entry_val)
                 limit_price = float(self.exchange.price_to_precision(symbol, ref_price))
 
-            # Strictly calculate amount or abort if invalid
-            amount = self.calculate_amount(symbol, ref_price)
+            sl_price_num = float(sl_val) if has_sl else None
+
+            # 1. Compute and set dynamic leverage safely
+            safe_leverage = self.calculate_safe_leverage(ref_price, sl_price_num)
+            self.set_leverage(symbol, safe_leverage)
+
+            # 2. Calculate quantity strictly sized to risk_usdt
+            amount = self.calculate_amount(symbol, ref_price, sl_price_num)
 
         except Exception as e:
             print(f"[!] Signal rejected/skipped for {symbol}: {e}")
@@ -170,8 +226,11 @@ class TradeExecutionService:
         # Build WEEX native contract payload
         params: Dict[str, Any] = {
             "positionSide": position_side,
-            "timeInForce": "GTC"
         }
+
+        # timeInForce must ONLY be passed for limit orders
+        if not is_market:
+            params["timeInForce"] = "GTC"
 
         if has_tp:
             formatted_tp = str(self.exchange.price_to_precision(symbol, float(tp_val)))
@@ -183,7 +242,7 @@ class TradeExecutionService:
             params["slTriggerPrice"] = formatted_sl
             params["SlWorkingType"] = "MARK_PRICE"
 
-        print(f"[*] Placing {order_type.upper()} {side.upper()} order for {amount} {symbol}...")
+        print(f"[*] Placing {order_type.upper()} {side.upper()} order for {amount} {symbol} ({safe_leverage}x leverage)...")
         if has_tp or has_sl:
             print(f"    Attached TP: {params.get('tpTriggerPrice')} | SL: {params.get('slTriggerPrice')}")
 
@@ -212,6 +271,7 @@ class TradeExecutionService:
             "type": order_type,
             "side": side,
             "amount": amount,
+            "leverage": safe_leverage,
             "price": limit_price or ref_price,
             "tp": float(tp_val) if has_tp else None,
             "sl": float(sl_val) if has_sl else None,
@@ -219,17 +279,16 @@ class TradeExecutionService:
             "raw_signal": signal
         }
 
-"""
+
 if __name__ == "__main__":
-    service = TradeExecutionService(risk_usdt=20.0, sandbox=True)
+    service = TradeExecutionService(risk_usdt=10.0, sandbox=False)
     test_signal = {
-        "pair": "DOGEUSDT",
+        "pair": "ZAMAUSDT",
         "action": "LONG",
         "entry": "CMP",
-        "tp": 0.093,
-        "sl": 0.0919,
+        "tp": 0.095,
+        "sl": 0.087,
         "message_id": "test123"
     }
     result = service.execute_signal(test_signal)
     print(result)
-"""

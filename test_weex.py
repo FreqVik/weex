@@ -190,7 +190,7 @@ class TradeExecutionService:
             "raw_signal": signal
         }
 
-"""
+
 if __name__ == "__main__":
     # To run on live: service = TradeExecutionService(risk_usdt=20.0, sandbox=False)
     service = TradeExecutionService(risk_usdt=20.0, sandbox=True)
@@ -211,10 +211,10 @@ if __name__ == "__main__":
     print("\n--- Active Positions ---")
     for pos in positions:
         print(f"Symbol: {pos['symbol']}, Side: {pos['side']}, Contracts: {pos['contracts']}, Entry: {pos['entryPrice']}")
-"""
-"""
+
+
     # 2. Inspect open orders (safe in sandbox, functional in live)
     open_orders = service.fetch_open_orders("BTC/USDT:USDT")
     print(f"\n--- Open Orders ({len(open_orders)}) ---")
     print(open_orders)
-"""
+
