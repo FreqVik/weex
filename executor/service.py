@@ -16,15 +16,16 @@ class TradeExecutionService:
     - TP == float    -> Set Take-Profit
     - SL == float    -> Set Stop-Loss
     - Position size sized to lose target risk_usdt on SL.
-    - Strictly clamped to a 25 USDT wallet limit to prevent -1191 margin rejections.
+    - Strictly clamped to a 19.5 USDT wallet limit to prevent -1191 margin rejections.
+    - Dynamic leverage ensures liquidation price is substantially beyond the Stop Loss.
     """
 
-    def __init__(self, risk_usdt: float = 10.0, max_wallet_limit: float = 25.0, sandbox: Optional[bool] = None):
+    def __init__(self, risk_usdt: float = 10.0, max_wallet_limit: float = 19.5, sandbox: Optional[bool] = None):
         self.api_key = os.getenv("WEEX_API_KEY")
         self.secret = os.getenv("WEEX_SECRET_KEY")
         self.passphrase = os.getenv("WEEX_PASSPHRASE")
         self.risk_usdt = risk_usdt
-        self.max_wallet_limit = max_wallet_limit  # Caps wallet margin baseline to 25 USDT for safety
+        self.max_wallet_limit = max_wallet_limit  # Caps wallet margin baseline to 19.5 USDT
 
         if not (self.api_key and self.secret and self.passphrase):
             raise ValueError("WEEX API credentials missing in .env (WEEX_API_KEY, WEEX_SECRET_KEY, WEEX_PASSPHRASE).")
@@ -70,8 +71,8 @@ class TradeExecutionService:
     @staticmethod
     def resolve_symbol(pair: str) -> str:
         """
-        Converts parsed strings (e.g., 'UNIUSDT', 'JTOUSDT', 'ZAMAUSDT')
-        into CCXT standard swap notation: 'UNI/USDT:USDT', 'JTO/USDT:USDT'
+        Converts parsed strings (e.g., 'UNIUSDT', 'JTOUSDT', 'ADAUSDT')
+        into CCXT standard swap notation: 'UNI/USDT:USDT', 'ADA/USDT:USDT'
         """
         clean = pair.upper().replace("/", "").replace("-", "").strip()
         if clean.endswith("USDT"):
@@ -79,11 +80,12 @@ class TradeExecutionService:
             return f"{base}/USDT:USDT"
         return f"{clean}/USDT:USDT"
 
-    def calculate_safe_leverage(self, ref_price: float, sl_price: Optional[float]) -> int:
+    def calculate_safe_leverage(self, ref_price: float, sl_price: Optional[float], mmr: float = 0.01) -> int:
         """
-        Calculates safe leverage dynamically so liquidation is safely
-        behind the Stop Loss, keeping initial margin within small wallet bounds.
-        Clamped to 20x max to support altcoin tier restrictions.
+        Calculates safe leverage dynamically so liquidation is substantially
+        past the Stop Loss (liquidation distance is at least 1.8x the SL distance,
+        accounting for exchange maintenance margin rate).
+        Capped at 15x maximum to prevent dangerous altcoin tier spikes.
         """
         if not sl_price or sl_price <= 0:
             return 10  # Fallback leverage if no SL is provided
@@ -92,12 +94,13 @@ class TradeExecutionService:
         if sl_distance_pct <= 0:
             return 10
 
-        # Theoretical liquidation distance is ~1/leverage.
-        # Apply a 30% safety cushion (0.70 / sl_distance_pct).
-        calculated_leverage = int(0.70 / sl_distance_pct)
+        # Enforce: Liq_distance = (1 / leverage) - MMR >= 1.8 * sl_distance_pct
+        # leverage <= 1 / (1.8 * sl_distance_pct + MMR)
+        target_liq_distance = (1.8 * sl_distance_pct) + mmr
+        calculated_leverage = int(1.0 / target_liq_distance)
 
-        # Clamp between 3x (wide swings) and 20x (capped for altcoin tiers)
-        return max(3, min(calculated_leverage, 20))
+        # Clamp between 2x (for wide swings) and 15x (ensures non-paltry liquidation gap)
+        return max(2, min(calculated_leverage, 15))
 
     def set_leverage(self, symbol: str, leverage: int) -> None:
         """
@@ -119,11 +122,11 @@ class TradeExecutionService:
             except Exception as inner_e:
                 print(f"[!] Warning setting leverage for {symbol} ({leverage}x): {inner_e}")
 
-    def calculate_amount(self, symbol: str, reference_price: float, sl_price: Optional[float] = None, leverage: int = 20) -> float:
+    def calculate_amount(self, symbol: str, reference_price: float, sl_price: Optional[float] = None, leverage: int = 10) -> float:
         """
         Calculates order contract quantity so that:
         amount * |reference_price - sl_price| == self.risk_usdt ($10)
-        AND caps quantity to a maximum wallet balance assumption of 25 USDT.
+        AND caps quantity to a maximum wallet balance assumption of 19.5 USDT.
         """
         if not self.markets or symbol not in self.markets:
             raise ValueError(f"Market metadata not loaded or symbol '{symbol}' not found on WEEX.")
@@ -141,7 +144,7 @@ class TradeExecutionService:
         else:
             raw_qty = self.risk_usdt / reference_price
 
-        # 2. Strict 25 USDT Safety Balance Guard
+        # 2. Strict 19.5 USDT Safety Balance Guard
         try:
             balance_info = self.exchange.fetch_balance()
             free_balance = float(
@@ -150,23 +153,22 @@ class TradeExecutionService:
                 or 0.0
             )
 
-            # Cap effective balance to 25 USDT maximum for extra safety cushion
+            # Cap effective balance to 19.5 USDT maximum for an extra cash cushion
             effective_wallet = min(free_balance if free_balance > 0 else self.max_wallet_limit, self.max_wallet_limit)
 
-            # 85% utilization multiplier allows buffer for taker fees & execution slippage
+            # 85% utilization multiplier keeps buffer for taker fees & slippage
             max_affordable_notional = effective_wallet * leverage * 0.85
             max_affordable_qty = max_affordable_notional / reference_price
 
             if raw_qty > max_affordable_qty:
                 target_notional = raw_qty * reference_price
                 print(
-                    f"[!] Target notional (${target_notional:.2f}) exceeds the 25 USDT safety ceiling (${max_affordable_notional:.2f}).\n"
+                    f"[!] Target notional (${target_notional:.2f}) exceeds the 19.5 USDT safety ceiling (${max_affordable_notional:.2f}).\n"
                     f"    Clamping size from {raw_qty:.2f} down to {max_affordable_qty:.2f} {symbol}."
                 )
                 raw_qty = max_affordable_qty
 
         except Exception as e:
-            # Fallback if fetch_balance network fails: use hardcoded 25 USDT threshold
             max_affordable_notional = self.max_wallet_limit * leverage * 0.85
             max_affordable_qty = max_affordable_notional / reference_price
             if raw_qty > max_affordable_qty:
@@ -207,7 +209,7 @@ class TradeExecutionService:
         Validates signal parameters and executes the order on WEEX.
         Attaches native TP/SL parameters directly to the entry order payload.
         Sets dynamic leverage and sizes strictly to risk_usdt on SL,
-        clamped to the 25 USDT balance ceiling.
+        clamped to the 19.5 USDT balance ceiling.
         """
         raw_pair = signal["pair"]
         action = signal["action"].upper()
@@ -238,11 +240,11 @@ class TradeExecutionService:
 
             sl_price_num = float(sl_val) if has_sl else None
 
-            # 1. Compute and set dynamic leverage safely
+            # 1. Compute safe leverage with substantial buffer beyond SL
             safe_leverage = self.calculate_safe_leverage(ref_price, sl_price_num)
             self.set_leverage(symbol, safe_leverage)
 
-            # 2. Calculate quantity strictly sized to risk_usdt (clamped by 25 USDT limit)
+            # 2. Calculate quantity strictly sized to risk_usdt (clamped by 19.5 USDT ceiling)
             amount = self.calculate_amount(symbol, ref_price, sl_price_num, leverage=safe_leverage)
 
         except Exception as e:
@@ -312,15 +314,14 @@ class TradeExecutionService:
 
 
 if __name__ == "__main__":
-    # Test with UNIUSDT using the 25 USDT assumption
-    service = TradeExecutionService(risk_usdt=10.0, max_wallet_limit=25.0, sandbox=False)
+    service = TradeExecutionService(risk_usdt=10.0, max_wallet_limit=19.5, sandbox=False)
     test_signal = {
-        "pair": "UNIUSDT",
+        "pair": "ADAUSDT",
         "action": "SHORT",
-        "entry": "CMP",
-        "tp": 8.149,
-        "sl": 9.303,
-        "message_id": "test_uni_clamped"
+        "entry": 0.2736,
+        "tp": 0.2635,
+        "sl": 0.2769,
+        "message_id": "test_buffer_check"
     }
     result = service.execute_signal(test_signal)
     print(result)
