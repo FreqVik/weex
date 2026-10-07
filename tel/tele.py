@@ -22,7 +22,7 @@ class TelegramSignalMonitor:
     ):
         self.api_id = int(api_id or os.getenv("API_ID", 0))
         self.api_hash = api_hash or os.getenv("API_HASH", "")
-        self.channel = channel or os.getenv("CHANNEL_USERNAME", "")
+        self.channel = channel or int(os.getenv("CHANNEL_USERNAME", ""))
         
         if not self.api_id or not self.api_hash or not self.channel:
             raise ValueError("API_ID, API_HASH, and CHANNEL_USERNAME must be provided or set in environment variables.")

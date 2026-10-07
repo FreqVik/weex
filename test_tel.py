@@ -9,7 +9,7 @@ load_dotenv()
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
-TARGET_CHANNEL = os.getenv("CHANNEL_USERNAME")
+TARGET_CHANNEL = int(os.getenv("CHANNEL_USERNAME"))
 
 client = TelegramClient("user_session", API_ID, API_HASH)
 
