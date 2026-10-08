@@ -22,10 +22,18 @@ class TelegramSignalMonitor:
     ):
         self.api_id = int(api_id or os.getenv("API_ID", 0))
         self.api_hash = api_hash or os.getenv("API_HASH", "")
-        self.channel = channel or int(os.getenv("CHANNEL_USERNAME", ""))
-        
+        self.channel = channel or os.getenv("CHANNEL_USERNAME", "")
+
+        # Try converting channel to integer if it's a raw channel ID
+        if isinstance(self.channel, str) and (
+            self.channel.startswith("-100") or self.channel.isdigit()
+        ):
+            self.channel = int(self.channel)
+
         if not self.api_id or not self.api_hash or not self.channel:
-            raise ValueError("API_ID, API_HASH, and CHANNEL_USERNAME must be provided or set in environment variables.")
+            raise ValueError(
+                "API_ID, API_HASH, and CHANNEL_USERNAME must be provided or set in environment variables."
+            )
 
         self.client = TelegramClient(session_name, self.api_id, self.api_hash)
 
@@ -47,16 +55,17 @@ class TelegramSignalMonitor:
             return None
 
         t_lower = text.lower()
-        has_entry = "entry" in t_lower or "market order" in t_lower
         has_tp = "tp" in t_lower or "target" in t_lower
         has_sl = "sl" in t_lower or "stop" in t_lower
 
-        # Gate: must indicate an entry/order style and at least a TP or SL
-        if not (has_entry and (has_tp or has_sl)):
+        # Gate: must contain at least a Take Profit or Stop Loss
+        if not (has_tp or has_sl):
             return None
 
         # 1. Action: Long, Short, Buy, or Sell
-        action_match = re.search(r"\b(long|short(?: sell)?|buy|sell)\b", text, re.IGNORECASE)
+        action_match = re.search(
+            r"\b(long|short(?: sell)?|buy|sell)\b", text, re.IGNORECASE
+        )
         raw_action = action_match.group(1).upper() if action_match else "UNKNOWN"
         action = (
             "LONG"
@@ -64,15 +73,30 @@ class TelegramSignalMonitor:
             else ("SHORT" if "SHORT" in raw_action or raw_action == "SELL" else raw_action)
         )
 
-        # 2. Pair: Matches symbols like SANDUSDT, APTUSDT, BTC/USDT, #SOL
-        pair_match = re.search(r"#?([A-Z0-9]{2,10}(?:/|-)?(?:USDT|BUSD|USDC|PERP))\b", text, re.IGNORECASE)
-        pair = pair_match.group(1).upper().replace("/", "").replace("-", "") if pair_match else "UNKNOWN"
+        if action == "UNKNOWN":
+            return None
+
+        # 2. Pair: Matches symbols like WUSDT, SANDUSDT, APTUSDT, BTC/USDT, #SOLUSDT
+        pair_match = re.search(
+            r"#?([A-Z0-9]{2,10}(?:/|-)?(?:USDT|BUSD|USDC|PERP))\b",
+            text,
+            re.IGNORECASE,
+        )
+        pair = (
+            pair_match.group(1).upper().replace("/", "").replace("-", "")
+            if pair_match
+            else "UNKNOWN"
+        )
 
         if pair == "UNKNOWN":
             return None
 
-        # 3. Entry: Check for explicit entry line; fallback to CMP if MARKET ORDER
-        entry_match = re.search(rf"entry\s*[:\-]?\s*(cmp|{cls.NUMBER_PATTERN})", text, re.IGNORECASE)
+        # 3. Entry: Check for explicit numerical entry; defaults to CMP if missing or if MARKET ORDER
+        entry_match = re.search(
+            rf"(?:entry|enter|buy|sell)\s*[:\-]?\s*(cmp|{cls.NUMBER_PATTERN})",
+            text,
+            re.IGNORECASE,
+        )
         if entry_match:
             raw_val = entry_match.group(1).strip().upper()
             if "CMP" in raw_val:
@@ -80,15 +104,14 @@ class TelegramSignalMonitor:
             else:
                 parsed_entry = cls.clean_number(raw_val)
                 entry = parsed_entry if parsed_entry is not None else "CMP"
-        elif "market order" in t_lower:
-            entry = "CMP"
         else:
-            entry = "N/A"
+            # Fallback to CMP if marked market order or if no explicit price line was provided
+            entry = "CMP"
 
-        # 4. Take Profit: Handles numbers OR phrases like "leave it open", "open"
+        # 4. Take Profit: Handles numbers, hyphens (TP-0.013), or "open"
         tp: Union[float, str, None] = None
         tp_match = re.search(
-            rf"(?:tp|tp\s*1|target)\s*[:\-]?\s*({cls.NUMBER_PATTERN}|leave\s*it\s*open|open|trailing)",
+            rf"(?:tp|tp\s*1|target)\s*[:\-]*(?:[ ]*)({cls.NUMBER_PATTERN}|leave\s*it\s*open|open|trailing)",
             text,
             re.IGNORECASE,
         )
@@ -97,12 +120,16 @@ class TelegramSignalMonitor:
             numeric_tp = cls.clean_number(raw_tp)
             tp = numeric_tp if numeric_tp is not None else "OPEN"
 
-        # 5. Stop Loss
-        sl_match = re.search(rf"(?:sl|stop\s*loss)\s*[:\-]?\s*{cls.NUMBER_PATTERN}", text, re.IGNORECASE)
+        # 5. Stop Loss: Handles numbers and hyphens (SL-0.020)
+        sl_match = re.search(
+            rf"(?:sl|stop\s*loss|stop)\s*[:\-]*(?:[ ]*){cls.NUMBER_PATTERN}",
+            text,
+            re.IGNORECASE,
+        )
         sl = cls.clean_number(sl_match.group(1)) if sl_match else None
 
-        # Drop false positives where neither valid TP nor SL could be extracted
-        if tp is None and sl is None:
+        # Strictly require a numeric Stop Loss for position risk calculation
+        if sl is None:
             return None
 
         return {
@@ -167,6 +194,7 @@ class TelegramSignalMonitor:
                     print(f"\n[!] Live Signal Detected on {signal['pair']}: {signal}")
 
         await self.client.run_until_disconnected()
+
 
 """
 async def main():
