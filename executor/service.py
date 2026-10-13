@@ -12,20 +12,27 @@ class TradeExecutionService:
     Executes trades on WEEX based on parsed Telegram signals:
     - Entry == 'CMP' -> Market Order
     - Entry == float -> Limit Order
-    - TP == 'OPEN'   -> No TP bracket
-    - TP == float    -> Set Take-Profit
+    - TP == 'OPEN' / None -> Sets an automated 30% wallet profit target ($5.85 USDT)
+    - TP == float    -> Preserves signal TP or overrides if configured
     - SL == float    -> Set Stop-Loss
     - Position size sized to lose target risk_usdt on SL.
     - Strictly clamped to a 19.5 USDT wallet limit to prevent -1191 margin rejections.
-    - Dynamic leverage ensures liquidation price is substantially beyond the Stop Loss.
+    - Dynamic leverage ensures liquidation price sits safely and substantially beyond the SL.
     """
 
-    def __init__(self, risk_usdt: float = 10.0, max_wallet_limit: float = 19.5, sandbox: Optional[bool] = None):
+    def __init__(
+        self,
+        risk_usdt: float = 10.0,
+        max_wallet_limit: float = 19.5,
+        sandbox: Optional[bool] = None,
+        enforce_30pct_tp: bool = True,
+    ):
         self.api_key = os.getenv("WEEX_API_KEY")
         self.secret = os.getenv("WEEX_SECRET_KEY")
         self.passphrase = os.getenv("WEEX_PASSPHRASE")
         self.risk_usdt = risk_usdt
         self.max_wallet_limit = max_wallet_limit  # Caps wallet margin baseline to 19.5 USDT
+        self.enforce_30pct_tp = enforce_30pct_tp  # Targets +30% of wallet limit ($5.85)
 
         if not (self.api_key and self.secret and self.passphrase):
             raise ValueError("WEEX API credentials missing in .env (WEEX_API_KEY, WEEX_SECRET_KEY, WEEX_PASSPHRASE).")
@@ -105,13 +112,14 @@ class TradeExecutionService:
     def set_leverage(self, symbol: str, leverage: int) -> None:
         """
         Sets the leverage on WEEX for the specified symbol.
-        Provides both isolatedLongLeverage and isolatedShortLeverage
-        to prevent WEEX error code -1141.
+        Provides isolatedLongLeverage, isolatedShortLeverage, and marginMode
+        to satisfy WEEX endpoint requirements and eliminate error -1141.
         """
         try:
             params = {
-                "isolatedLongLeverage": leverage,
-                "isolatedShortLeverage": leverage,
+                "marginMode": "isolated",
+                "isolatedLongLeverage": str(leverage),
+                "isolatedShortLeverage": str(leverage),
             }
             self.exchange.set_leverage(leverage, symbol, params=params)
             print(f"[*] Set leverage to {leverage}x for {symbol}")
@@ -163,7 +171,7 @@ class TradeExecutionService:
             if raw_qty > max_affordable_qty:
                 target_notional = raw_qty * reference_price
                 print(
-                    f"[!] Target notional (${target_notional:.2f}) exceeds the 19.5 USDT safety ceiling (${max_affordable_notional:.2f}).\n"
+                    f"[!] Target notional (${target_notional:.2f}) exceeds the {self.max_wallet_limit} USDT safety ceiling (${max_affordable_notional:.2f}).\n"
                     f"    Clamping size from {raw_qty:.2f} down to {max_affordable_qty:.2f} {symbol}."
                 )
                 raw_qty = max_affordable_qty
@@ -208,8 +216,8 @@ class TradeExecutionService:
         """
         Validates signal parameters and executes the order on WEEX.
         Attaches native TP/SL parameters directly to the entry order payload.
-        Sets dynamic leverage and sizes strictly to risk_usdt on SL,
-        clamped to the 19.5 USDT balance ceiling.
+        Sets dynamic safe leverage, sizes strictly to risk_usdt on SL,
+        clamped to the wallet balance ceiling, and attaches the 30% wallet gain TP.
         """
         raw_pair = signal["pair"]
         action = signal["action"].upper()
@@ -224,7 +232,6 @@ class TradeExecutionService:
         is_market = isinstance(entry_val, str) and entry_val.strip().upper() == "CMP"
         order_type = "market" if is_market else "limit"
 
-        has_tp = tp_val is not None and not (isinstance(tp_val, str) and tp_val.strip().upper() == "OPEN")
         has_sl = sl_val is not None and not (isinstance(sl_val, str) and sl_val.strip().upper() == "OPEN")
 
         try:
@@ -244,7 +251,7 @@ class TradeExecutionService:
             safe_leverage = self.calculate_safe_leverage(ref_price, sl_price_num)
             self.set_leverage(symbol, safe_leverage)
 
-            # 2. Calculate quantity strictly sized to risk_usdt (clamped by 19.5 USDT ceiling)
+            # 2. Calculate quantity strictly sized to risk_usdt (clamped by wallet ceiling)
             amount = self.calculate_amount(symbol, ref_price, sl_price_num, leverage=safe_leverage)
 
         except Exception as e:
@@ -265,8 +272,22 @@ class TradeExecutionService:
         if not is_market:
             params["timeInForce"] = "GTC"
 
-        if has_tp:
-            formatted_tp = str(self.exchange.price_to_precision(symbol, float(tp_val)))
+        # 3. Take Profit Determination
+        # If enforce_30pct_tp is enabled (or signal TP is 'OPEN' / missing), calculate 30% gain on wallet limit ($5.85 USDT)
+        tp_price_target: Optional[float] = None
+        if self.enforce_30pct_tp or tp_val is None or (isinstance(tp_val, str) and tp_val.strip().upper() == "OPEN"):
+            target_profit_usdt = self.max_wallet_limit * 0.30  # $5.85 USDT gain
+            price_delta_for_30pct = target_profit_usdt / amount
+
+            if action == "LONG":
+                tp_price_target = ref_price + price_delta_for_30pct
+            else:
+                tp_price_target = ref_price - price_delta_for_30pct
+        else:
+            tp_price_target = float(tp_val)
+
+        if tp_price_target and tp_price_target > 0:
+            formatted_tp = str(self.exchange.price_to_precision(symbol, tp_price_target))
             params["tpTriggerPrice"] = formatted_tp
             params["TpWorkingType"] = "CONTRACT_PRICE"
 
@@ -276,8 +297,7 @@ class TradeExecutionService:
             params["SlWorkingType"] = "MARK_PRICE"
 
         print(f"[*] Placing {order_type.upper()} {side.upper()} order for {amount} {symbol} ({safe_leverage}x leverage)...")
-        if has_tp or has_sl:
-            print(f"    Attached TP: {params.get('tpTriggerPrice')} | SL: {params.get('slTriggerPrice')}")
+        print(f"    Attached TP: {params.get('tpTriggerPrice')} | SL: {params.get('slTriggerPrice')}")
 
         try:
             order_result = self.exchange.create_order(
@@ -306,22 +326,23 @@ class TradeExecutionService:
             "amount": amount,
             "leverage": safe_leverage,
             "price": limit_price or ref_price,
-            "tp": float(tp_val) if has_tp else None,
-            "sl": float(sl_val) if has_sl else None,
+            "tp": float(params.get("tpTriggerPrice")) if "tpTriggerPrice" in params else None,
+            "sl": float(params.get("slTriggerPrice")) if "slTriggerPrice" in params else None,
             "exchange_response": order_result,
             "raw_signal": signal
         }
 
-
+"""
 if __name__ == "__main__":
-    service = TradeExecutionService(risk_usdt=10.0, max_wallet_limit=19.5, sandbox=False)
+    service = TradeExecutionService(risk_usdt=10.0, max_wallet_limit=19.5, sandbox=True, enforce_30pct_tp=True)
     test_signal = {
-        "pair": "ADAUSDT",
+        "pair": "JUPUSDT",
         "action": "SHORT",
-        "entry": 0.2736,
-        "tp": 0.2635,
-        "sl": 0.2769,
-        "message_id": "test_buffer_check"
+        "entry": "CMP",
+        "tp": 0.2800,
+        "sl": 0.3335,
+        "message_id": "test_bat_automated_30pct"
     }
     result = service.execute_signal(test_signal)
     print(result)
+"""
