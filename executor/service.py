@@ -1,6 +1,6 @@
 # executor/service.py
 import os
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 from dotenv import load_dotenv
 import ccxt
 
@@ -12,12 +12,10 @@ class TradeExecutionService:
     Executes trades on WEEX based on parsed Telegram signals:
     - Entry == 'CMP' -> Market Order
     - Entry == float -> Limit Order
-    - TP == 'OPEN' / None -> Sets an automated 30% wallet profit target ($5.85 USDT)
-    - TP == float    -> Preserves signal TP or overrides if configured
-    - SL == float    -> Set Stop-Loss
-    - Position size sized to lose target risk_usdt on SL.
-    - Strictly clamped to a 19.5 USDT wallet limit to prevent -1191 margin rejections.
-    - Dynamic leverage ensures liquidation price sits safely and substantially beyond the SL.
+    - Enforces an automated 20% wallet profit target ($3.90 USDT) per trade.
+    - Sized to risk target risk_usdt on SL, clamped to a 19.5 USDT wallet ceiling.
+    - Dynamic safe leverage formula ensuring a substantial liquidation cushion beyond SL.
+    - Pre-filters pairs against WEEX's API Trading Symbols whitelist to prevent -1058 errors.
     """
 
     def __init__(
@@ -25,19 +23,20 @@ class TradeExecutionService:
         risk_usdt: float = 10.0,
         max_wallet_limit: float = 19.5,
         sandbox: Optional[bool] = None,
-        enforce_30pct_tp: bool = True,
+        enforce_fixed_tp: bool = True,
+        target_wallet_tp_pct: float = 0.20,  # 20% wallet profit target ($3.90 USDT)
     ):
         self.api_key = os.getenv("WEEX_API_KEY")
         self.secret = os.getenv("WEEX_SECRET_KEY")
         self.passphrase = os.getenv("WEEX_PASSPHRASE")
         self.risk_usdt = risk_usdt
-        self.max_wallet_limit = max_wallet_limit  # Caps wallet margin baseline to 19.5 USDT
-        self.enforce_30pct_tp = enforce_30pct_tp  # Targets +30% of wallet limit ($5.85)
+        self.max_wallet_limit = max_wallet_limit
+        self.enforce_fixed_tp = enforce_fixed_tp
+        self.target_wallet_tp_pct = target_wallet_tp_pct
 
         if not (self.api_key and self.secret and self.passphrase):
             raise ValueError("WEEX API credentials missing in .env (WEEX_API_KEY, WEEX_SECRET_KEY, WEEX_PASSPHRASE).")
 
-        # Pull from env if not explicitly passed (defaults to True for safety)
         if sandbox is None:
             self.sandbox = os.getenv("WEEX_SANDBOX", "true").strip().lower() in ("true", "1", "yes")
         else:
@@ -45,9 +44,10 @@ class TradeExecutionService:
 
         self.exchange = self._init_exchange()
         self.markets = None
+        self.api_supported_symbols: Set[str] = set()
 
     def _init_exchange(self) -> ccxt.Exchange:
-        """Initializes WEEX via ccxt."""
+        """Initializes WEEX via CCXT."""
         if not hasattr(ccxt, "weex"):
             raise ValueError("Installed ccxt version does not support 'weex'. Upgrade via 'pip install ccxt --upgrade'")
 
@@ -57,7 +57,7 @@ class TradeExecutionService:
             "password": self.passphrase,
             "enableRateLimit": True,
             "options": {
-                "defaultType": "swap",  # Perpetual / Futures swap contracts
+                "defaultType": "swap",
             }
         })
 
@@ -70,17 +70,24 @@ class TradeExecutionService:
         return exchange
 
     def load_markets(self):
-        """Loads and caches exchange market precision and lot sizes."""
+        """Loads and caches market precision and fetches API-supported trading symbols."""
         if not self.markets:
             print("[*] Fetching market metadata from WEEX...")
             self.markets = self.exchange.load_markets()
 
+            try:
+                # Query WEEX endpoint: GET /capi/v3/market/apiTradingSymbols
+                eligible = self.exchange.public_get_capi_v3_market_apitradingsymbols()
+                if isinstance(eligible, list):
+                    self.api_supported_symbols = {
+                        f"{s[:-4]}/USDT:USDT" for s in eligible if isinstance(s, str) and s.endswith("USDT")
+                    }
+                    print(f"[*] Loaded {len(self.api_supported_symbols)} API-whitelisted futures symbols.")
+            except Exception as e:
+                print(f"[!] Note: Could not fetch apiTradingSymbols whitelist ({e}). Falling back to markets list.")
+
     @staticmethod
     def resolve_symbol(pair: str) -> str:
-        """
-        Converts parsed strings (e.g., 'UNIUSDT', 'JTOUSDT', 'ADAUSDT')
-        into CCXT standard swap notation: 'UNI/USDT:USDT', 'ADA/USDT:USDT'
-        """
         clean = pair.upper().replace("/", "").replace("-", "").strip()
         if clean.endswith("USDT"):
             base = clean[:-4]
@@ -89,32 +96,23 @@ class TradeExecutionService:
 
     def calculate_safe_leverage(self, ref_price: float, sl_price: Optional[float], mmr: float = 0.01) -> int:
         """
-        Calculates safe leverage dynamically so liquidation is substantially
-        past the Stop Loss (liquidation distance is at least 1.8x the SL distance,
-        accounting for exchange maintenance margin rate).
-        Capped at 15x maximum to prevent dangerous altcoin tier spikes.
+        Dynamically calculates safe leverage ensuring liquidation is placed
+        at least 1.8x the SL distance away. Clamped between 2x and 15x.
         """
         if not sl_price or sl_price <= 0:
-            return 10  # Fallback leverage if no SL is provided
+            return 10
 
         sl_distance_pct = abs(ref_price - sl_price) / ref_price
         if sl_distance_pct <= 0:
             return 10
 
-        # Enforce: Liq_distance = (1 / leverage) - MMR >= 1.8 * sl_distance_pct
-        # leverage <= 1 / (1.8 * sl_distance_pct + MMR)
         target_liq_distance = (1.8 * sl_distance_pct) + mmr
         calculated_leverage = int(1.0 / target_liq_distance)
 
-        # Clamp between 2x (for wide swings) and 15x (ensures non-paltry liquidation gap)
         return max(2, min(calculated_leverage, 15))
 
     def set_leverage(self, symbol: str, leverage: int) -> None:
-        """
-        Sets the leverage on WEEX for the specified symbol.
-        Provides isolatedLongLeverage, isolatedShortLeverage, and marginMode
-        to satisfy WEEX endpoint requirements and eliminate error -1141.
-        """
+        """Sets leverage while passing isolatedLongLeverage/isolatedShortLeverage to satisfy WEEX."""
         try:
             params = {
                 "marginMode": "isolated",
@@ -131,11 +129,7 @@ class TradeExecutionService:
                 print(f"[!] Warning setting leverage for {symbol} ({leverage}x): {inner_e}")
 
     def calculate_amount(self, symbol: str, reference_price: float, sl_price: Optional[float] = None, leverage: int = 10) -> float:
-        """
-        Calculates order contract quantity so that:
-        amount * |reference_price - sl_price| == self.risk_usdt ($10)
-        AND caps quantity to a maximum wallet balance assumption of 19.5 USDT.
-        """
+        """Sizes position based on risk_usdt, strictly clamped by the 19.5 USDT safety balance ceiling."""
         if not self.markets or symbol not in self.markets:
             raise ValueError(f"Market metadata not loaded or symbol '{symbol}' not found on WEEX.")
 
@@ -147,24 +141,19 @@ class TradeExecutionService:
             price_distance = abs(reference_price - sl_price)
             if price_distance <= 0:
                 raise ValueError(f"Entry ({reference_price}) and SL ({sl_price}) cannot be identical.")
-
             raw_qty = self.risk_usdt / price_distance
         else:
             raw_qty = self.risk_usdt / reference_price
 
-        # 2. Strict 19.5 USDT Safety Balance Guard
+        # 2. Safety Balance Guard (19.5 USDT max baseline, 85% utilization multiplier)
         try:
             balance_info = self.exchange.fetch_balance()
             free_balance = float(
-                balance_info.get("USDT", {}).get("free") 
-                or balance_info.get("SUSDT", {}).get("free") 
+                balance_info.get("USDT", {}).get("free")
+                or balance_info.get("SUSDT", {}).get("free")
                 or 0.0
             )
-
-            # Cap effective balance to 19.5 USDT maximum for an extra cash cushion
             effective_wallet = min(free_balance if free_balance > 0 else self.max_wallet_limit, self.max_wallet_limit)
-
-            # 85% utilization multiplier keeps buffer for taker fees & slippage
             max_affordable_notional = effective_wallet * leverage * 0.85
             max_affordable_qty = max_affordable_notional / reference_price
 
@@ -175,50 +164,28 @@ class TradeExecutionService:
                     f"    Clamping size from {raw_qty:.2f} down to {max_affordable_qty:.2f} {symbol}."
                 )
                 raw_qty = max_affordable_qty
-
-        except Exception as e:
+        except Exception:
             max_affordable_notional = self.max_wallet_limit * leverage * 0.85
             max_affordable_qty = max_affordable_notional / reference_price
             if raw_qty > max_affordable_qty:
                 raw_qty = max_affordable_qty
 
-        # 3. Format according to exchange step size & precision
+        # 3. Precision format & limits check
         formatted_qty_str = self.exchange.amount_to_precision(symbol, raw_qty)
-
-        try:
-            qty = float(formatted_qty_str)
-        except (ValueError, TypeError):
-            raise ValueError(f"Failed to parse formatted quantity '{formatted_qty_str}' for symbol '{symbol}'.")
+        qty = float(formatted_qty_str)
 
         if qty <= 0:
             raise ValueError(f"Calculated amount {qty} is too small for precision of '{symbol}'.")
 
-        # 4. Enforce minimum order threshold
         market = self.markets[symbol]
-        market_limits = market.get("limits", {}).get("amount", {})
-        min_amount = market_limits.get("min")
+        min_amount = market.get("limits", {}).get("amount", {}).get("min")
         if min_amount is not None and qty < min_amount:
-            raise ValueError(
-                f"Calculated amount ({qty}) is below exchange minimum order size ({min_amount}) for '{symbol}'."
-            )
+            raise ValueError(f"Calculated amount ({qty}) is below exchange minimum order size ({min_amount}) for '{symbol}'.")
 
         return qty
 
-    def fetch_positions(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-        """Fetches open positions (works on both live and sandbox)."""
-        try:
-            return self.exchange.fetch_positions(symbols)
-        except Exception as e:
-            print(f"[!] Error fetching positions: {e}")
-            return []
-
     def execute_signal(self, signal: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Validates signal parameters and executes the order on WEEX.
-        Attaches native TP/SL parameters directly to the entry order payload.
-        Sets dynamic safe leverage, sizes strictly to risk_usdt on SL,
-        clamped to the wallet balance ceiling, and attaches the 30% wallet gain TP.
-        """
+        """Validates signal parameters and executes order with native 20% TP and SL attached."""
         raw_pair = signal["pair"]
         action = signal["action"].upper()
         entry_val = signal.get("entry", "CMP")
@@ -231,11 +198,14 @@ class TradeExecutionService:
 
         is_market = isinstance(entry_val, str) and entry_val.strip().upper() == "CMP"
         order_type = "market" if is_market else "limit"
-
         has_sl = sl_val is not None and not (isinstance(sl_val, str) and sl_val.strip().upper() == "OPEN")
 
         try:
             self.load_markets()
+
+            # Pre-filter against API whitelist to avoid -1058 errors
+            if self.api_supported_symbols and symbol not in self.api_supported_symbols:
+                raise ValueError(f"{symbol} is UI-only on WEEX and not enabled for automated API trading.")
 
             if is_market:
                 ticker = self.exchange.fetch_ticker(symbol)
@@ -246,12 +216,9 @@ class TradeExecutionService:
                 limit_price = float(self.exchange.price_to_precision(symbol, ref_price))
 
             sl_price_num = float(sl_val) if has_sl else None
-
-            # 1. Compute safe leverage with substantial buffer beyond SL
             safe_leverage = self.calculate_safe_leverage(ref_price, sl_price_num)
             self.set_leverage(symbol, safe_leverage)
 
-            # 2. Calculate quantity strictly sized to risk_usdt (clamped by wallet ceiling)
             amount = self.calculate_amount(symbol, ref_price, sl_price_num, leverage=safe_leverage)
 
         except Exception as e:
@@ -263,26 +230,26 @@ class TradeExecutionService:
                 "raw_signal": signal
             }
 
-        # Build WEEX native contract payload
         params: Dict[str, Any] = {
             "positionSide": position_side,
         }
 
-        # timeInForce must ONLY be passed for limit orders
         if not is_market:
             params["timeInForce"] = "GTC"
 
-        # 3. Take Profit Determination
-        # If enforce_30pct_tp is enabled (or signal TP is 'OPEN' / missing), calculate 30% gain on wallet limit ($5.85 USDT)
+        # -------------------------------------------------------------
+        # Enforced 20% Wallet Target Profit Rule:
+        # Desired Gain = $19.50 * 20% = $3.90 USDT
+        # -------------------------------------------------------------
         tp_price_target: Optional[float] = None
-        if self.enforce_30pct_tp or tp_val is None or (isinstance(tp_val, str) and tp_val.strip().upper() == "OPEN"):
-            target_profit_usdt = self.max_wallet_limit * 0.30  # $5.85 USDT gain
-            price_delta_for_30pct = target_profit_usdt / amount
+        if self.enforce_fixed_tp or tp_val is None or (isinstance(tp_val, str) and tp_val.strip().upper() == "OPEN"):
+            target_profit_usdt = self.max_wallet_limit * self.target_wallet_tp_pct  # $3.90 USDT
+            price_delta_for_tp = target_profit_usdt / amount
 
             if action == "LONG":
-                tp_price_target = ref_price + price_delta_for_30pct
+                tp_price_target = ref_price + price_delta_for_tp
             else:
-                tp_price_target = ref_price - price_delta_for_30pct
+                tp_price_target = ref_price - price_delta_for_tp
         else:
             tp_price_target = float(tp_val)
 
@@ -334,14 +301,20 @@ class TradeExecutionService:
 
 """
 if __name__ == "__main__":
-    service = TradeExecutionService(risk_usdt=10.0, max_wallet_limit=19.5, sandbox=True, enforce_30pct_tp=True)
+    service = TradeExecutionService(
+        risk_usdt=10.0,
+        max_wallet_limit=19.5,
+        sandbox=True,
+        enforce_fixed_tp=True,
+        target_wallet_tp_pct=0.20  # +20% ($3.90 gain)
+    )
     test_signal = {
-        "pair": "JUPUSDT",
+        "pair": "DOGEUSDT",
         "action": "SHORT",
         "entry": "CMP",
-        "tp": 0.2800,
-        "sl": 0.3335,
-        "message_id": "test_bat_automated_30pct"
+        "tp": 0.07600,
+        "sl": 0.083,
+        "message_id": "test_doge_automated_20pct"
     }
     result = service.execute_signal(test_signal)
     print(result)
