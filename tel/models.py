@@ -1,8 +1,8 @@
-
 from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from typing import Optional
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -23,12 +23,12 @@ class Signal(Base):
     __tablename__ = "signals"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_message_id: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True, index=True)
+    telegram_message_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(16), index=True)
     pair: Mapped[str] = mapped_column(String(32), index=True)
-    entry: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    tp: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    sl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    tp: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    sl: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     raw_snippet: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -49,6 +49,7 @@ def get_session():
         yield session
     finally:
         session.close()
+
 
 def get_db():
     db = SessionLocal()
