@@ -1,4 +1,3 @@
-# service.py
 import asyncio
 import json
 import os
@@ -10,7 +9,6 @@ from rq import Queue
 from tel.models import create_tables
 from tel.tele import TelegramSignalMonitor
 from tel.tasks import save_signal_to_db
-
 
 load_dotenv()
 
@@ -27,7 +25,6 @@ class SignalService:
     def serialize_signal(self, signal: dict) -> str:
         """Converts signal dictionary to a JSON string safe for Redis transit."""
         payload = signal.copy()
-        # Convert datetime objects to ISO strings if present
         for key, val in payload.items():
             if isinstance(val, datetime):
                 payload[key] = val.isoformat()
@@ -45,13 +42,15 @@ class SignalService:
     async def on_new_signal(self, signal: dict, event: object) -> None:
         """
         Async callback passed into TelegramSignalMonitor.listen().
-        Offloads synchronous Redis and RQ calls without freezing the event loop.
+        Uses run_in_executor for Python 3.8 compatibility instead of asyncio.to_thread.
         """
+        loop = asyncio.get_running_loop()
+
         # 1. Publish immediately to Redis Pub/Sub
-        await asyncio.to_thread(self.publish_signal, signal)
+        await loop.run_in_executor(None, self.publish_signal, signal)
 
         # 2. Enqueue background persistence
-        await asyncio.to_thread(self.enqueue_db_save, signal)
+        await loop.run_in_executor(None, self.enqueue_db_save, signal)
 
         print(f"[*] Dispatched {signal['action']} {signal['pair']} to Redis & RQ")
 
@@ -63,6 +62,11 @@ class SignalService:
         await self.monitor.listen(callback=self.on_new_signal)
 
 
-if __name__ == "__main__":
+async def main():
+    # Instantiate client and service strictly INSIDE the running event loop
     service = SignalService()
-    asyncio.run(service.run())
+    await service.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
