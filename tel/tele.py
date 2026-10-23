@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import re
-from typing import Optional, Dict, Any, Union, Callable, Awaitable
+from typing import Optional, Dict, Any, Union, Callable, Awaitable, List
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.network import connection
 
 load_dotenv()
 
@@ -17,16 +20,17 @@ class TelegramSignalMonitor:
         self,
         api_id: Optional[Union[str, int]] = None,
         api_hash: Optional[str] = None,
-        channel: Optional[str] = None,
+        channel: Optional[Union[str, int]] = None,
         session_name: str = "user_session",
     ):
-        self.api_id = int(api_id or os.getenv("API_ID", 0))
+        raw_id = api_id or os.getenv("API_ID", 0)
+        self.api_id = int(raw_id)
         self.api_hash = api_hash or os.getenv("API_HASH", "")
         self.channel = channel or os.getenv("CHANNEL_USERNAME", "")
 
-        # Try converting channel to integer if it's a raw channel ID
+        # Try converting channel to integer if it's a numeric channel ID
         if isinstance(self.channel, str) and (
-            self.channel.startswith("-100") or self.channel.isdigit()
+            self.channel.startswith("-100") or self.channel.lstrip("-").isdigit()
         ):
             self.channel = int(self.channel)
 
@@ -35,7 +39,13 @@ class TelegramSignalMonitor:
                 "API_ID, API_HASH, and CHANNEL_USERNAME must be provided or set in environment variables."
             )
 
-        self.client = TelegramClient(session_name, self.api_id, self.api_hash)
+        self.client = TelegramClient(
+            session_name,
+            self.api_id,
+            self.api_hash,
+            use_ipv6=False,
+            connection=connection.ConnectionTcpAbridged,
+        )
 
     @staticmethod
     def clean_number(num_str: Optional[str]) -> Optional[float]:
@@ -105,7 +115,6 @@ class TelegramSignalMonitor:
                 parsed_entry = cls.clean_number(raw_val)
                 entry = parsed_entry if parsed_entry is not None else "CMP"
         else:
-            # Fallback to CMP if marked market order or if no explicit price line was provided
             entry = "CMP"
 
         # 4. Take Profit: Handles numbers, hyphens (TP-0.013), or "open"
@@ -145,10 +154,10 @@ class TelegramSignalMonitor:
         """Starts and authenticates the Telethon client session."""
         await self.client.start()
 
-    async def scan_history(self, limit: int = 100) -> list[Dict[str, Any]]:
+    async def scan_history(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Scans past messages and returns a list of all parsed signals."""
         print(f"Scanning @{self.channel} for the last {limit} messages...\n")
-        signals = []
+        signals: List[Dict[str, Any]] = []
 
         async for message in self.client.iter_messages(self.channel, limit=limit):
             if not message.text:
